@@ -1,0 +1,186 @@
+
+import cv2
+import os
+import parameters as params
+import copy
+from collections import deque
+import numpy as np
+from ctypes import *
+from numpy.ctypeslib import ndpointer
+import utils
+
+
+class Tracker:
+    def __init__(self):
+        self.id     = None       #id of the tracker
+        # self.start  = None
+        # self.end    = None
+        self.bbox   = None
+        self.comp   = None      # detector's component of the tracker
+        self.score    = None    # detector's score of the tracker
+        # self.length   = 1
+        self.missed   = 0       # number of frames the tracker loses the target
+        
+class Tracking:
+    def __init__(self, method = "KCF"):       
+        self.trackers = deque()
+        self.numTrackers = 0    # number of total trackers
+        self._tracker = None
+        ###  Load KCF tracker lib
+        ##############################################
+        if method == "KCF":
+            _libPathStr = 'KCF/build/lib/libkcfwrapper.dylib'
+        elif method == "TLDKCF":
+            _libPathStr = 'TLDKCF/build/lib/libtldwrapper.dylib'
+
+        _libPathFull    = os.path.join(os.path.dirname(__file__), _libPathStr)
+        self._tracker = cdll.LoadLibrary(_libPathFull)            
+
+        self._tracker.init.restype = None
+        self._tracker.init.argtypes = [ndpointer(c_ubyte, ndim=3, flags='C_CONTIGUOUS'), #im
+                             c_int, #cols
+                             c_int, #rows
+                             ndpointer(c_int, ndim=1, flags='C_CONTIGUOUS'), #bounding box
+                             c_int] #id of tracker
+
+        self._tracker.update.restype = None
+        self._tracker.update.argtypes = [ndpointer(c_ubyte, ndim=3, flags='C_CONTIGUOUS'),#im
+                               c_int, #cols
+                               c_int, #rows
+                               ndpointer(c_int, ndim=1, flags='C_CONTIGUOUS'),#bounding box
+                               c_int] # id of tracker
+        ###################################################
+
+    ##############################################
+    def initTracker(self,newDets,frameNum,imTrack):
+        ######################################################
+        ### Add new trackers here 
+        numNewDets = newDets.shape[0]
+        for i in range(numNewDets):
+            newTracker = Tracker()
+            newTracker.id = self.numTrackers
+            self.numTrackers += 1            
+            newTracker.bbox = newDets[i,:-2]
+            newTracker.comp = newDets[i,-2]
+            newTracker.score = newDets[i,-1]            
+            
+            # Init bbox
+            bboxInit = np.zeros(4,dtype=np.int32)
+            temp = newDets[i,:-2].astype(np.int32) 
+            bboxInit[0] = temp[0]
+            bboxInit[1] = temp[1]
+            bboxInit[2] = temp[2]-temp[0]
+            bboxInit[3] = temp[3]-temp[1] 
+
+            # Init KCF tracker                    
+            rows = imTrack.shape[0]
+            cols = imTrack.shape[1] 
+            self._tracker.init(imTrack, rows, cols, bboxInit, newTracker.id)             
+            self.trackers.append(newTracker)   
+
+    ############################################################################################
+    ## Pass the current frame to KCF tracker and get the bounding box of the target
+    def updateTracker(self,imTrack,imPre = None):        
+        if self.numTrackers < 1:
+            return    
+
+        for i in range(self.numTrackers):
+            # If tracker is not active, pass
+            if self.trackers[i].missed > params.maxMissAllowed:
+                self.trackers[i].missed += 1
+                continue
+
+            bbox = np.zeros(5,dtype=np.int32)           
+            rows = imTrack.shape[0]
+            cols = imTrack.shape[1]                        
+            self._tracker.update(imTrack, rows, cols, bbox, self.trackers[i].id)                        
+
+            isTrackerValid = bool(bbox[4])
+            if isTrackerValid is False:
+                self.trackers[i].missed += 1
+                # print "Tracker Failed !!!"                              
+            else:                
+                self.trackers[i].bbox[0] = bbox[0]
+                self.trackers[i].bbox[1] = bbox[1]
+                self.trackers[i].bbox[2] = bbox[0] + bbox[2]
+                self.trackers[i].bbox[3] = bbox[1] + bbox[3]
+
+    ############################################################################################
+    ## After C3 detection, try to associate detections with existing trackers.
+    ## If a detection is not associated with a tracker, initialize a new tracker for it.
+    def associate(self,dets,imTrack):
+        numDets = dets.shape[0]
+        detsMatched = [-1]*numDets
+        trackersMatched = [-1]*self.numTrackers
+        M = (-1)*np.ones((self.numTrackers, numDets))  # similarity matrix
+
+        ###################### Associate new detections with trackers.
+        # ############### Calculate Similarity Matrix M
+        if numDets > 0:
+            for i in range(self.numTrackers):
+                if self.trackers[i].missed < params.maxMissAllowed:
+                    for j in range(numDets):
+                        similarity = 0
+                        bb1 = self.trackers[i].bbox
+                        bb2 = dets[j,:-2]
+                        overlap, _ = utils.getOverlap(bb1,bb2)
+                        if overlap > params.overlapThreshold:
+                            M[i,j] = overlap
+
+        ################# Use Greedy Algorithm to match pairs
+            for i in range(self.numTrackers):
+                if np.max(M) < 0:
+                    break
+                else:
+                    ind = np.argmax(M)
+                    idx = int(ind) / M.shape[1]
+                    idy = int(ind) % M.shape[1]
+                    trackersMatched[idx] = idy
+                    detsMatched[idy] = idx
+                    M[idx,:] = -1
+                    M[:,idy] = -1
+
+        # ############################################################
+        # ##### Update tracker status
+        for i in range(self.numTrackers):
+
+            if not trackersMatched[i] == -1:                                   
+                self.trackers[i].missed = 0
+                self.trackers[i].comp = dets[trackersMatched[i],-2]
+                self.trackers[i].score = dets[trackersMatched[i],-1]
+                # self.trackers[i].bbox = dets[trackersMatched[i],:-2]
+
+                ### Optinal: Update tracker model for every new valid detection, otherwise KCF uses the initial model
+                # rows = imTrack.shape[0]
+                # cols = imTrack.shape[1]
+                # imKCF = copy.copy(imTrack) 
+                # temp =  self.trackers[i].bbox
+                # bboxInit = np.zeros(4,dtype=np.int32)
+                # bboxInit[0] = temp[0]
+                # bboxInit[1] = temp[1]
+                # bboxInit[2] = temp[2]-temp[0]
+                # bboxInit[3] = temp[3]-temp[1]
+                # _tracker.init(imKCF, rows, cols, bboxInit, self.trackers[i].id)
+
+
+        ##### New detection verification and adding new trackers
+        newDets = []
+        for i in range(numDets):
+            if detsMatched[i] == -1:
+                newDets.append(dets[i])
+        newDets = np.asarray(newDets)
+        return newDets
+
+    def terminateTrackers(self, maxNumTrackers):
+        ############## Terminate the oldest inactive tracker. 
+        ###  the number of trackers is limited to maxNumTrackers.        
+        temp = -1
+        idx = None
+        while self.numTrackers > maxNumTrackers:
+            for i in range(self.numTrackers):
+                if self.trackers[i].missed > temp:
+                    temp = self.trackers[i].missed
+                    idx = i
+            if idx is not None:
+                self.trackers.remove(self.trackers[idx])
+                self.numTrackers = self.numTrackers - 1
